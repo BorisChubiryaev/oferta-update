@@ -2,6 +2,7 @@
 // в браузерный бандл ни при каких обстоятельствах.
 import "server-only";
 import { checkApiKey } from "./key";
+import { explainStatus, isJsonModeRejection } from "./protocol";
 
 const ENDPOINT = "https://openrouter.ai/api/v1/chat/completions";
 /** Проверка ключа: бесплатна и не тратит токены — годится для диагностики. */
@@ -117,7 +118,29 @@ export async function probeKey(): Promise<KeyProbe> {
   }
 }
 
-async function once(messages: ChatMessage[], signal: AbortSignal): Promise<ChatResult> {
+/**
+ * Поддерживает ли выбранная модель режим JSON (`response_format`).
+ *
+ * Выясняется только опытным путём: OpenRouter маршрутизирует запрос к
+ * провайдеру (Novita, Together и т.д.), и поддержка зависит от связки
+ * «модель + провайдер», а не от модели как таковой. Поэтому — не таблица
+ * известных моделей, которая устареет к следующей неделе, а один отказ,
+ * запомненный на время жизни процесса.
+ *
+ * `null` — ещё не проверяли.
+ */
+let jsonModeSupported: boolean | null = null;
+
+/** Явное «не просить JSON» для окружения, где это заведомо не работает. */
+function jsonModeDisabledByEnv(): boolean {
+  return (process.env.OPENROUTER_JSON_MODE ?? "").toLowerCase() === "off";
+}
+
+async function once(
+  messages: ChatMessage[],
+  signal: AbortSignal,
+  jsonMode: boolean,
+): Promise<ChatResult> {
   const res = await fetch(ENDPOINT, {
     method: "POST",
     signal,
@@ -128,18 +151,29 @@ async function once(messages: ChatMessage[], signal: AbortSignal): Promise<ChatR
       // Разбор инструкции — задача на точность, не на фантазию.
       temperature: 0,
       max_tokens: 4096,
-      // Просим JSON. Не все модели уважают этот флаг, поэтому ответ всё равно
-      // проходит через терпимый к обёрткам разбор (см. extractJson).
-      response_format: { type: "json_object" },
+      // Просим JSON — но только если эта связка «модель + провайдер» его умеет.
+      // Часть провайдеров на неподдерживаемый флаг отвечает не молчаливым
+      // игнорированием, а отказом 400, и тогда запрос не проходит вовсе.
+      // Формат ответа этим флагом не держится в любом случае: разбор терпим
+      // к обёрткам (см. extractJson), а схема всё равно проверяется отдельно.
+      ...(jsonMode ? { response_format: { type: "json_object" } } : {}),
     }),
   });
 
   if (!res.ok) {
     const body = await res.text().catch(() => "");
+    if (jsonMode && isJsonModeRejection(res.status, body)) {
+      // Не ошибка настройки и не повод беспокоить оператора: просто эта модель
+      // не умеет режим JSON. Запоминаем и повторяем без флага — следующие
+      // инструкции пойдут сразу правильным путём, лишнего запроса не будет.
+      jsonModeSupported = false;
+      return once(messages, signal, false);
+    }
     // 429 (лимит бесплатной модели) и 5xx имеет смысл повторить, 4xx — нет.
     const retriable = res.status === 429 || res.status >= 500;
     throw new OpenRouterError(explainStatus(res.status, body), res.status, retriable);
   }
+  if (jsonMode) jsonModeSupported = true;
 
   const data = (await res.json()) as {
     choices?: { message?: { content?: string } }[];
@@ -159,7 +193,9 @@ export async function chat(messages: ChatMessage[]): Promise<ChatResult> {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
     try {
-      return await once(messages, ctrl.signal);
+      // Пока не выяснили обратное — просим JSON: с ним ответ чище.
+      const jsonMode = !jsonModeDisabledByEnv() && jsonModeSupported !== false;
+      return await once(messages, ctrl.signal, jsonMode);
     } catch (e) {
       last = e;
       const retriable =
@@ -179,40 +215,7 @@ export async function chat(messages: ChatMessage[]): Promise<ChatResult> {
 // здесь, чтобы у вызывающего кода был один вход.
 export { extractJson } from "./json";
 
-/**
- * Сообщение об ошибке, по которому понятно, что делать.
- *
- * Голый код с телом ответа оператору бесполезен: «401 Missing Authentication
- * header» одинаково выглядит и при отозванном ключе, и при ключе чужого
- * сервиса, и при пробеле в переменной. Разбор формы ключа к этому моменту уже
- * пройден, значит остаются причины на стороне OpenRouter — их и называем.
- */
-function explainStatus(status: number, body: string): string {
-  const tail = body.slice(0, 300);
-  switch (status) {
-    case 401:
-      return (
-        "OpenRouter не принял ключ (401). Форму ключа мы проверили, значит дело в самом " +
-        "ключе: он отозван, удалён или скопирован не полностью. Создайте новый на " +
-        "https://openrouter.ai/keys, пропишите в Vercel и сделайте Redeploy. " +
-        `Ответ OpenRouter: ${tail}`
-      );
-    case 402:
-      return (
-        "На счёте OpenRouter недостаточно средств (402). Для бесплатных моделей " +
-        `(:free) это обычно означает исчерпанный дневной лимит. Ответ: ${tail}`
-      );
-    case 404:
-      return (
-        "OpenRouter не знает такой модели (404). Проверьте переменную OPENROUTER_MODEL — " +
-        `бесплатные модели пишутся с суффиксом «:free». Ответ: ${tail}`
-      );
-    case 429:
-      return (
-        "Лимит запросов исчерпан (429) — обычное дело для бесплатных моделей. " +
-        `Запрос будет повторён с паузой. Ответ: ${tail}`
-      );
-    default:
-      return `OpenRouter вернул ${status}: ${tail}`;
-  }
-}
+// Разбор ответа модели (json.ts) и разбор ответов протокола (protocol.ts)
+// живут отдельно и переэкспортируются здесь, чтобы у вызывающего кода был
+// один вход.
+export { isJsonModeRejection, explainStatus } from "./protocol";
