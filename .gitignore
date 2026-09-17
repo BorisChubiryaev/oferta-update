@@ -1,0 +1,20 @@
+node_modules/
+.next/
+out/
+dist/
+*.tsbuildinfo
+next-env.d.ts
+
+# Секреты: ключ OpenRouter живёт только в переменных окружения Vercel.
+.env
+.env.local
+.env.*.local
+
+.DS_Store
+*.log
+.vercel
+
+# Реальные документы для прогонов держим вне репозитория: это внутренние
+# нормативные документы банка, им не место в истории git.
+samples/
+out/
