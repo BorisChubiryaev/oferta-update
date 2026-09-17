@@ -14,6 +14,15 @@ type Stage = "upload" | "review" | "done";
 interface AiHealth {
   configured: boolean;
   model: string;
+  /** Что именно не так с ключом — заполняется, когда configured=false. */
+  message?: string;
+  problem?: string;
+}
+
+interface KeyProbe {
+  ok: boolean;
+  message: string;
+  label?: string;
 }
 
 function download(data: Uint8Array, name: string) {
@@ -44,6 +53,8 @@ export default function Page() {
   const [showOld, setShowOld] = useState(true);
 
   const [health, setHealth] = useState<AiHealth | null>(null);
+  const [probe, setProbe] = useState<KeyProbe | null>(null);
+  const [probing, setProbing] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [progress, setProgress] = useState({ done: 0, total: 0 });
   const [error, setError] = useState<string | null>(null);
@@ -181,9 +192,54 @@ export default function Page() {
               {health === null
                 ? "Проверяем доступность ИИ…"
                 : health.configured
-                  ? `ИИ доступен: ${health.model}`
-                  : "Ключ OPENROUTER_API_KEY не задан — работает только алгоритмический разбор."}
+                  ? `Ключ настроен. Модель: ${health.model}`
+                  : "Работает только алгоритмический разбор — см. ниже."}
             </p>
+
+            {health && !health.configured && health.message && (
+              <div className="notice err" style={{ marginBottom: 12 }}>
+                {health.message}
+              </div>
+            )}
+
+            {health && (
+              <div className="row" style={{ marginBottom: 12 }}>
+                <button
+                  className="tiny"
+                  disabled={probing}
+                  onClick={async () => {
+                    setProbing(true);
+                    setProbe(null);
+                    try {
+                      const r = await fetch("/api/ai/health?probe=1");
+                      const d = (await r.json()) as AiHealth & { probe?: KeyProbe };
+                      setHealth(d);
+                      setProbe(d.probe ?? { ok: false, message: "Проверка не выполнена" });
+                    } catch (e) {
+                      setProbe({
+                        ok: false,
+                        message: e instanceof Error ? e.message : "Проверка не выполнена",
+                      });
+                    } finally {
+                      setProbing(false);
+                    }
+                  }}
+                >
+                  {probing ? "Проверяем…" : "Проверить ключ у OpenRouter"}
+                </button>
+                <span style={{ color: "var(--muted)", fontSize: 12 }}>
+                  Мгновенно и без расхода токенов — спрашиваем OpenRouter, принимает ли он ключ.
+                </span>
+              </div>
+            )}
+
+            {probe && (
+              <div className={`notice ${probe.ok ? "info" : "err"}`}>
+                {probe.ok ? "✅ " : "❌ "}
+                {probe.message}
+                {probe.label ? ` (ключ «${probe.label}»)` : ""}
+              </div>
+            )}
             <div className="grid2">
               <label className="toggle">
                 <input
